@@ -1,0 +1,181 @@
+require 'net/http'
+require 'json'
+require 'base64'
+require 'uri'
+require 'fileutils'
+require 'securerandom'
+
+class StudyPartner
+  # 同時に立ち上げるヘッドレスブラウザ(PDF変換)の数を制限する。
+  # ブラウザプロセスはメモリ・CPU消費が大きいため、無制限に並列化すると
+  # 同時アクセス時にPC全体が重くなり、Gemini呼び出し等も含めてタイムアウトしやすくなる。
+  MAX_CONCURRENT_PDF_CONVERSIONS = 2
+
+  def initialize(gemini_key:)
+    @gemini_key = gemini_key
+    @pdf_semaphore = Mutex.new
+    @pdf_conversion_count = 0
+    @pdf_conversion_resource = ConditionVariable.new
+  end
+
+  # メイン処理：テキストまたは画像を受け取ってPDFを生成し、生成先のファイル名を返す
+  def generate_pdf_from_input(image_binary: nil, text_message: nil, output_dir: "public/pdfs")
+    FileUtils.mkdir_p(output_dir) unless Dir.exist?(output_dir)
+
+    system_prompt = <<~TEXT
+      あなたは難関大受験生から絶大な支持を得ている「超一流の数学講師」であり、同時にプロの「教材デザイナー」です。
+      入力された問題（テキストまたは画像）に対し、極めて丁寧で洗練された参考書スタイルの解説を作成し、完全な1つのHTMLコード（<!DOCTYPE html>から始める）として出力してください。
+
+      【解説テキストの必須6セクション構成】
+      1. 【問題設定】ボックス（二重線などの高級感ある枠線）
+      2. 💡 思考の糸口（初見時の試行プロセス・最初の着眼）
+      3. ➤ 着眼点と解法の必然性（「なぜその解法を選ぶのか」の論理的理由づけ）
+      4. ➤ 本質へと導く4段階の徹底解説
+         - ①【理解の段階】（条件と目標整理）
+         - ②【計画の段階】（ロードマップ設計）
+         - ③【実行の段階】（途中式の省略なし、対比解法、HTML/SVGによる図解）
+         - ④【検討の段階】（妥当性検証）
+      5. 👑 【抽象論と普遍的パターンの整理】（背景を黒/濃いグレーにした白抜き文字の見出し）
+      6. 📚 類題チャレンジ（本問よりやや高難度な1問＋超詳細解説）
+
+      【厳格遵守：デザイン・数式・文字化け防止ルール】
+      - ページ設定:
+        <style>内に `@page { size: A4; margin: 20mm 15mm; }` を記述すること。
+      - 文字化け防止:
+        フォントは外部ネットワークから読み込まず、OS標準の日本語フォントのみを使うこと。
+        `body { font-family: 'Yu Mincho', 'YuMincho', 'MS Mincho', 'Times New Roman', serif; }`
+        Google Fonts等の外部CSS・<link>タグは一切使用しないこと。
+      - 数式記述に関する絶対禁止事項:
+        - LaTeXコード（`$`, `$$`, `\frac`, `\sqrt`, `\alpha` 等）は一切使用禁止。
+        - 数式はすべてプレーンテキスト、HTMLタグ（`<sub>`, `<sup>`, `<i>`）、およびHTML実体参照（`&plusmn;`, `&radic;`, `&ge;`, `&le;` 等）で記述すること。
+        - 数式クラス（<span class="math">など）には `font-family: 'Times New Roman', serif;` を指定すること。
+
+      出力は説明文などの前置きを一切入れず、HTMLコードのみを出力してください。
+    TEXT
+
+    parts = [{ text: system_prompt }]
+
+    if image_binary
+      image_base64 = Base64.strict_encode64(image_binary)
+      parts << { inline_data: { mime_type: 'image/jpeg', data: image_base64 } }
+      parts << { text: "上記画像の数学問題を解説してください。" }
+    elsif text_message
+      parts << { text: "【問題】\n#{text_message}" }
+    else
+      raise "問題データがありません。"
+    end
+
+    uri = URI("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=#{@gemini_key}")
+    payload = {
+      contents: [{ parts: parts }],
+      generationConfig: {
+        # じっくり考えさせて解説の質を上げる(応答は多少遅くなる)
+        thinkingConfig: { thinkingLevel: "high" }
+      }
+    }
+
+    res = post_json_with_retry(uri, payload)
+
+    if res["error"]
+      puts "【Gemini API Error】: #{res['error']['message']}"
+      raise "Gemini APIエラー: #{res['error']['message']}"
+    end
+
+    html_code = res.dig("candidates", 0, "content", "parts", 0, "text") || ""
+    html_code.gsub!(/^```html\s*/, '')
+    html_code.gsub!(/^```\s*/, '')
+    html_code.gsub!(/\s*```$/, '')
+    html_code.strip!
+
+    # ファイル名は同時アクセスでも衝突しないよう、タイムスタンプ+乱数で一意にする
+    unique_id = "#{Time.now.strftime('%Y%m%d_%H%M%S')}_#{SecureRandom.hex(4)}"
+    filename = "explanation_#{unique_id}.pdf"
+    file_path = File.join(output_dir, filename)
+
+    convert_html_to_pdf(html_code, file_path, unique_id)
+
+    filename
+  end
+
+  private
+
+  # PDF変換(ブラウザ起動)の同時実行数を制限する。
+  # 上限に達している間は空きが出るまで待機する(単純なカウンティングセマフォ)。
+  def with_pdf_conversion_slot
+    @pdf_semaphore.synchronize do
+      while @pdf_conversion_count >= MAX_CONCURRENT_PDF_CONVERSIONS
+        @pdf_conversion_resource.wait(@pdf_semaphore)
+      end
+      @pdf_conversion_count += 1
+    end
+
+    yield
+  ensure
+    @pdf_semaphore.synchronize do
+      @pdf_conversion_count -= 1
+      @pdf_conversion_resource.signal
+    end
+  end
+
+  def convert_html_to_pdf(html_content, output_pdf_path, unique_id)
+    with_pdf_conversion_slot do
+      # 一時HTMLファイル名もリクエストごとに一意にする(共有ファイルにしない)
+      temp_html = File.expand_path("tmp_#{unique_id}.html")
+      abs_pdf_path = File.expand_path(output_pdf_path)
+
+      File.write(temp_html, html_content, encoding: 'UTF-8')
+
+      edge_path = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
+      chrome_path = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
+      browser_path = File.exist?(edge_path) ? edge_path : (File.exist?(chrome_path) ? chrome_path : nil)
+
+      raise "ブラウザ（Edge/Chrome）が見つかりません。" unless browser_path
+
+      # 各プロセスに専用のuser-data-dirを与え、複数のヘッドレスChrome/Edgeを
+      # 同時に安全に起動できるようにする(共有すると同時起動時にロックで失敗するため)
+      user_data_dir = File.expand_path("tmp_profile_#{unique_id}")
+
+      cmd = "\"#{browser_path}\" --headless=new --disable-gpu " \
+            "--disable-extensions --disable-background-networking " \
+            "--disable-sync --disable-default-apps --no-first-run " \
+            "--disable-features=Translate --mute-audio " \
+            "--user-data-dir=\"#{user_data_dir}\" " \
+            "--print-to-pdf=\"#{abs_pdf_path}\" \"file:///#{temp_html}\""
+
+      success = system(cmd)
+      raise "PDF変換に失敗しました(ブラウザの終了コードが異常)" unless success && File.exist?(abs_pdf_path)
+    ensure
+      File.delete(temp_html) if temp_html && File.exist?(temp_html)
+      FileUtils.rm_rf(user_data_dir) if user_data_dir && Dir.exist?(user_data_dir)
+    end
+  end
+
+  # Gemini API呼び出し。一時的なタイムアウト/5xxエラーは最大2回までリトライする。
+  def post_json_with_retry(uri, payload, max_retries: 2)
+    attempt = 0
+    begin
+      attempt += 1
+      post_json(uri, payload)
+    rescue Net::ReadTimeout, Net::OpenTimeout, Errno::ECONNRESET, Errno::ETIMEDOUT => e
+      if attempt <= max_retries
+        puts "【Gemini API リトライ】#{attempt}回目失敗: #{e.class}: #{e.message}"
+        sleep(2 * attempt) # 単純な指数バックオフ
+        retry
+      else
+        raise "Gemini APIへの接続がタイムアウトしました(#{attempt}回試行): #{e.message}"
+      end
+    end
+  end
+
+  def post_json(uri, payload)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true
+    http.open_timeout = 15
+    http.read_timeout = 240 # thinkingLevel: high にしたため、以前より長めに確保
+
+    req = Net::HTTP::Post.new(uri.request_uri, { 'Content-Type' => 'application/json' })
+    req.body = payload.to_json
+    res = http.request(req)
+    JSON.parse(res.body)
+  end
+end
