@@ -8,12 +8,6 @@ set :public_folder, 'public'
 set :bind, '0.0.0.0'
 
 # --- 公開URLの決定 ---------------------------------------------------------
-# request.host を使ってURLを組み立てると、Hostヘッダー詐称でPDFのURLが
-# 偽装されるリスクがある。そこで Rack::Protection::HostAuthorization で
-# 検証するのではなく、そもそも request.host を使わず .env に固定した
-# 公開URLだけを信頼する方式にする(ngrok経由だとX-Forwarded-Hostが絡んで
-# HostAuthorizationの判定がずれることがあるため、この方がシンプルで確実)。
-# .env に PUBLIC_BASE_URL=https://xxxx.ngrok-free.dev のように設定しておく。
 PUBLIC_BASE_URL = ENV['PUBLIC_BASE_URL']
 
 configure do
@@ -21,11 +15,6 @@ configure do
     puts "【警告】PUBLIC_BASE_URL が未設定です。.envに設定してください(例: https://xxxx.ngrok-free.dev)。"
   end
 
-  # Sinatra 4.1+ は Rack::Protection::HostAuthorization を組み込みで常時有効化し、
-  # デフォルトでは localhost 系のみを許可する。set :protection の except では
-  # 制御できず、専用の :host_authorization 設定でしか変更できない。
-  # request.host は上記の通り信頼せず PUBLIC_BASE_URL のみを使う設計なので、
-  # ここでは許可ホストを空にしてこのチェック自体を無効化する。
   set :host_authorization, { permitted_hosts: [] }
 end
 
